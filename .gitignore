@@ -1,0 +1,9 @@
+node_modules/
+.env
+.env.*
+!.env.example
+coverage/
+*.log
+.npm-cache/
+supabase/.temp/
+

@@ -1,0 +1,273 @@
+# Step Tracker review
+
+Reviewed the actual `E:\DailyTask` backend and `E:\Daily Task frontend` app.
+The existing steps controllers/routes were retained. They already follow the
+Water Tracker's Controller -> Service -> Supabase structure, use the shared
+authentication middleware and authenticated Supabase client, and are registered
+in `src/app.js`. All responses retain the existing `{ "data": ... }` or
+`{ "error": { "code": ..., "message": ... } }` envelope.
+
+## Issues found first
+
+1. A lower, late PUT could replace a higher daily total. An upsert by itself
+   prevents duplicates only when its database unique key exists; it does not
+   prevent a stale aggregate from overwriting newer data.
+2. No steps SQL migration was checked in. The service assumed tables, columns,
+   a user/date unique key and RLS that could not be verified from the project.
+3. Local browser CORS omitted PUT; JSON content-type enforcement also omitted it.
+4. The service assigned database timestamps in Node and trusted persisted goal
+   values without validating them before calculating progress.
+5. No steps API/database regression tests existed.
+6. Flutter's existing sensor tracker saved only its current day locally. It had
+   no API client or persisted retry queue, and replaced the previous daily total
+   on date rollover. Its maximum goal was 1,000,000 versus the API's 200,000.
+7. Flutter used the phone's calendar while the backend defaulted to Asia/Kolkata.
+
+The connected Supabase account returned no accessible projects. **Live tables,
+policies, logs, migration history and deployment have not been inspected or
+changed.** SQL was verified with in-memory PostgreSQL (PGlite), not the live
+Supabase project. HTTP tests use the real Supabase SDK with local Auth/REST
+fixtures; they do not claim a deployed PostgREST end-to-end test.
+
+## Exact changed files
+
+Backend paths are relative to `E:\DailyTask`:
+
+| File | Reason |
+| --- | --- |
+| `src/app.js` | Permit development PUT preflights; require JSON for PUT, preserving the existing multipart avatar exception |
+| `src/services/steps.service.js` | Validate saved goals; let PostgreSQL assign step/goal timestamps |
+| `supabase/migrations/20261026162943_harden_step_tracking.sql` | Safely create/adopt compatible steps tables, constraints, least-privilege grants, ownership RLS and atomic monotonic updates |
+| `test/steps.test.js` | Real Express/Supabase SDK HTTP contract, validation, ownership, rate limit and failure/retry coverage |
+| `test/steps-database.test.js` | Execute the actual migration and test constraints, RLS, monotonic upserts, adoption and rollback |
+| `test/cors.test.js` | Add the steps PUT preflight regression |
+| `STEPS_REVIEW.md` | This report and deployment/testing instructions |
+
+Frontend paths are relative to `E:\Daily Task frontend`:
+
+| File | Reason |
+| --- | --- |
+| `lib/services/step_api_service.dart` | Existing PUT/PATCH routes, exact JSON fields, bounded requests, current access tokens and one 401 refresh; requests are bound to their owning account |
+| `lib/services/step_service.dart` | Persist daily totals and acknowledged totals with the sensor checkpoint; serialize sync, preserve pending historical dates, retry in foreground and align the goal range |
+| `lib/screens/home_screen.dart` | Inject the steps API into the existing lazily created step service and dispose its transport |
+| `lib/screens/step_tracker_screen.dart` | Sync status/retry action and matching goal validation |
+| `android/app/src/main/kotlin/com/example/daily_habit_tracker/MainActivity.kt` | Expose the device's named timezone through the existing native bridge |
+| `test/step_api_service_test.dart` | Token, contract, ownership, timeout, failure and acknowledgement tests |
+| `test/step_sync_test.dart` | Outbox, offline/restart, date, reboot, stale acknowledgement and goal-race tests |
+| `test/step_test_support.dart` | Add isolated sync fixtures to the existing test helper |
+| `test/step_screen_test.dart` | Sync timer/status and responsive UI coverage; update goal boundary text |
+| `STEP_TRACKER.md` | Update the previous local-only documentation |
+
+No Water Tracker controller/service/schema, authentication implementation,
+Supabase configuration, notification module or profile implementation was
+rewritten. No dependency was added for this review.
+
+## Database migration: apply before using sync
+
+The CLI generated this new migration file:
+
+`E:\DailyTask\supabase\migrations\20261026162943_harden_step_tracking.sql`
+
+Inspect your project first using its SQL editor:
+
+```sql
+select table_name, column_name, data_type, is_nullable
+from information_schema.columns
+where table_schema = 'public' and table_name in ('daily_steps', 'step_goals')
+order by table_name, ordinal_position;
+
+select tablename, indexdef from pg_indexes
+where schemaname = 'public' and tablename in ('daily_steps', 'step_goals');
+
+select tablename, policyname, permissive, roles, cmd, qual, with_check
+from pg_policies
+where schemaname = 'public' and tablename in ('daily_steps', 'step_goals');
+
+-- Run only if daily_steps already exists:
+select user_id, step_date, count(*) from public.daily_steps
+group by user_id, step_date having count(*) > 1;
+```
+
+Apply **only the new migration's complete SQL** to the correct project, once.
+It is a transaction: incompatible columns, null/invalid existing rows, orphaned
+users or duplicate records fail and roll back. It does not automatically
+deduplicate, overwrite or delete existing records. If it fails, inspect the
+reported condition before applying a correction; do not drop tables to force it.
+
+Existing compatible tables/data/policies remain. The new restrictive ownership
+policies combine with existing policies, so an existing broad permissive policy
+cannot expose another user's rows to `authenticated`. Existing restrictive
+policies/triggers can still impose their own restrictions and must be reviewed
+on the live database. The migration does not touch water tables or policies.
+
+This migration is intended to be applied once, with normal migration history;
+re-running it aborts on the existing named objects. Do not blindly replay the
+older Water migration if its SQL was previously applied manually. Use your
+established migration deployment flow once the remote history has been checked.
+
+The daily unique key is `(user_id, step_date)`. The UPDATE trigger applies
+`GREATEST(old.steps, new.steps)` while the upsert holds the row lock. Replays and
+lower totals preserve `updated_at`; a higher total advances it. Server-generated
+timestamps, immutable identities, finite dates and inclusive count bounds are
+enforced in PostgreSQL too. Trigger functions use SECURITY INVOKER and a fixed
+search path. No service-role key is used.
+
+## Verified API contract
+
+All five endpoints require a verified `Authorization: Bearer <access_token>`.
+The existing limit is 120 authenticated steps requests per minute per user.
+
+| Endpoint | Input | Success data/status |
+| --- | --- | --- |
+| `GET /api/steps/today` | No query/body | 200: `date, timezone, steps, daily_goal, remaining_steps, progress_percent, updated_at` |
+| `PUT /api/steps/today` | `{ "steps": 1200, "step_date": "YYYY-MM-DD" }`; date optional | 200: same daily summary, including the server's retained maximum |
+| `GET /api/steps/history` | `period=day\|week\|month`, optional `date=YYYY-MM-DD` | 200: `period, start_date, end_date, timezone, total_steps, days: [{date, steps}]` |
+| `GET /api/steps/goal` | No query/body | 200: `daily_goal, timezone` |
+| `PATCH /api/steps/goal` | Nonempty subset of `daily_goal, timezone` | 200: `daily_goal, timezone` |
+
+Steps are integers 0..200,000. Goals are integers 1..200,000; default 10,000.
+Dates must be exact, valid `YYYY-MM-DD`, years 0001..9998. Writes for dates later
+than today in the account timezone return 400. Historical writes are supported
+by the existing PUT, so an offline yesterday total can be retried today.
+Future history reads remain valid empty reports; they do not create records.
+Weeks start Monday; history end dates are exclusive; missing days are zero-filled.
+Progress may exceed 100%; remaining steps never become negative.
+
+Validation -> 400, missing/invalid authentication -> 401, forbidden database
+operation -> 403, unsupported content type -> 415, oversized body -> 413,
+throttling -> 429, database unavailability -> 503. Existing goal-insert conflicts
+are retried as a scoped update. PUT returns 200 for both creation and update,
+retaining its existing idempotent response contract.
+
+## Manual API examples (PowerShell)
+
+Use a real user's access token in your shell environment. Never use a service
+role key. These examples write that user's test aggregates; do not execute them
+against an unrelated account.
+
+```powershell
+Set-Location 'E:\DailyTask'
+$stepApi = 'http://127.0.0.1:3000/api/steps'
+$stepHeaders = @{ Authorization = "Bearer $env:STEP_TEST_ACCESS_TOKEN" }
+
+Invoke-RestMethod "$stepApi/goal" -Headers $stepHeaders
+Invoke-RestMethod "$stepApi/goal" -Method Patch -Headers $stepHeaders `
+  -ContentType 'application/json' -Body (@{daily_goal=7500; timezone='Asia/Kolkata'} | ConvertTo-Json)
+$stepDate = (Invoke-RestMethod "$stepApi/today" -Headers $stepHeaders).data.date
+
+# One row per date; replay or stale lower totals cannot decrease it.
+foreach ($stepTotal in @(100, 100, 500, 300)) {
+  Invoke-RestMethod "$stepApi/today" -Method Put -Headers $stepHeaders `
+    -ContentType 'application/json' -Body (@{step_date=$stepDate; steps=$stepTotal} | ConvertTo-Json)
+}
+
+foreach ($stepPeriod in @('day','week','month')) {
+  Invoke-RestMethod "$stepApi/history?period=$stepPeriod&date=$stepDate" -Headers $stepHeaders
+}
+
+# Expect 400; nothing is written.
+Invoke-RestMethod "$stepApi/today" -Method Put -Headers $stepHeaders `
+  -ContentType 'application/json' -Body '{"steps":-1}'
+Invoke-RestMethod "$stepApi/today" -Method Put -Headers $stepHeaders `
+  -ContentType 'application/json' -Body '{"steps":10,"step_date":"2026-02-30"}'
+Invoke-RestMethod "$stepApi/today" -Method Put -Headers $stepHeaders `
+  -ContentType 'application/json' -Body '{"steps":10,"step_date":"9998-12-31"}'
+# Expect 401:
+curl.exe -i "$stepApi/today"
+```
+
+API callers cannot provide another owner's ID: unexpected body/query fields
+return 400; the owner comes from the verified token. Test account B separately:
+its today/goal/history must not include account A's rows. The database tests also
+exercise direct forged inserts and cross-account updates under RLS.
+
+## Sync behavior and limits
+
+The phone still counts real sensor differences using the existing boot identity,
+baseline, permission and lifecycle logic. It does not send a request per step.
+One account-scoped JSON preference record now also stores each tracked date's
+total and its last acknowledged total. The checkpoint and outbox are serialized
+together before HTTP. Dates are preserved after midnight. A late acknowledgement
+only acknowledges the snapshot sent; a newer local total remains pending.
+Lost responses/failed local acknowledgement writes can safely replay.
+
+Attempts happen on initialization/resume, every 30 seconds in foreground, after
+a saved goal edit and through **Sync now**. Goal edits persist locally first.
+Network/API errors retain the outbox. Data uses the existing user access token;
+401 refreshes once, whereas timeouts/503 do not sign the user out. Signing out
+disposes that account's service and transport. A mismatched signed-in account
+cannot upload the old account's queued steps.
+
+The steps account timezone follows the active Android phone's named timezone.
+It is checked at startup/resume and during foreground sync. Existing queued
+date strings are never moved or regenerated on retry; changing timezone rebases
+the sensor conservatively. A date considered future by the server stays pending
+until valid; other acceptable dates can still sync. Goal/timezone changes across
+different devices use the existing last-writer-wins settings contract.
+
+This aggregate protocol assumes one active tracking phone per account. Across
+phones it keeps the maximum daily total; it cannot calculate the union of
+overlapping sensor streams. Downward corrections are intentionally not supported
+by PUT. A fresh install restores the account goal, but does not add cloud totals
+to a new sensor baseline: local count restoration after clearing app data needs
+a separate reconciliation design to avoid overlap/double counting. The cloud
+maximum remains intact. A real local total above 200,000 is kept and surfaced for
+review, never silently clamped or dropped.
+
+There is no background job/foreground service/boot sync receiver. Android process
+death, force stop, battery restrictions or no internet can delay sync until the
+next foreground attempt. Sensor totals spanning an unobserved midnight or reboot
+cannot be assigned accurately to a full day and are not invented. Shared
+preferences can lose data if app storage is cleared or disk writes fail.
+
+## Automated checks and real-device work
+
+Commands (no app launch/install):
+
+```powershell
+Set-Location 'E:\DailyTask'
+node --test --test-concurrency=1
+Set-Location 'E:\Daily Task frontend'
+flutter analyze
+flutter test --concurrency=1 --reporter expanded
+flutter build web --dart-define-from-file=config.local.json
+flutter build apk --debug --dart-define-from-file=config.local.json
+```
+
+Executed successfully on 26 October 2026:
+
+- Backend: **127 tests passed**, including all existing Water tests.
+- Flutter: **110 tests passed**; `flutter analyze` reported **No issues found**.
+- Web compilation: passed, including the Wasm dry run.
+- Android debug APK: passed; not launched or installed.
+
+Builds retain non-fatal toolchain warnings about a Cupertino font reference and
+the existing pedometer plugin's Kotlin Gradle Plugin integration. The latter
+will need compatible plugin/toolchain updates for future Flutter versions; this
+review did not change dependencies. These are compile checks, not a deployed API
+or hardware test. Production builds require an HTTPS API origin; the local
+HTTP configuration is for debug development.
+
+The database suite covers first/repeated/stale aggregates, unique keys, invalid
+counts/dates, failed writes followed by retry, ownership/RLS, goals, schema
+adoption, unsafe existing policies and rollback on duplicate existing data.
+The HTTP suite covers all five routes, calendar histories, bad inputs, database
+errors, authentication and per-user limiting. Flutter tests cover actual client
+JSON/token handling and deterministic local sensor/outbox/lifecycle scenarios.
+
+Still required on a real Android phone and the deployed backend:
+
+1. Apply/review the migration and verify live Auth -> Express -> PostgREST -> RLS.
+2. Check the real Physical activity prompt, denial, permanent denial and resume.
+3. Walk with the phone and check real hardware counts and sensor batching.
+4. Go offline, collect steps and change the goal; restart offline, reconnect and
+   verify exactly one cloud row per account/date with the retained aggregate.
+5. Background/force-stop and reopen; reboot; cross midnight; change named timezone.
+   Verify no reset gap is guessed and old dates stay queued/saved correctly.
+6. Switch accounts with pending data and verify isolation. Check water quick-add
+   and history after returning from steps.
+7. Confirm OEM battery/process behavior. Automated fixtures and APK compilation
+   do not verify guaranteed background counting or synchronization.
+
+References: [Supabase RLS](https://supabase.com/docs/guides/database/postgres/row-level-security),
+[PostgreSQL INSERT / ON CONFLICT](https://www.postgresql.org/docs/current/sql-insert.html).
