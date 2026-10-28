@@ -1,0 +1,16 @@
+# Use this workspace to collaborate
+workspace:
+  id: bb7fd498-37e4-41ed-a519-5bf98201db62
+
+# Each entry here maps a local resource to one or more corresponding objects in Postman Cloud
+
+cloudResources:
+  collections:
+    ../postman/collections/Daily Habit Tracker: 016e87bd-4779-428d-8c84-488e7ad89dff
+    ../postman/collections/DailyTask - Habits API: a3e56765-91ad-4771-8f2f-dbf55c98da1c
+
+# All resources in the `postman/` folder are automatically registered in Local View.
+# Point to additional files outside the `postman/` folder to register them individually. Example:
+#localResources:
+#  collections:
+#    - ../tests/E2E Test Collection/

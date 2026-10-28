@@ -1,0 +1,14 @@
+$kind: http-request
+url: "{{baseUrl}}/api/water/history?period=week&date={{date}}"
+method: GET
+queryParams:
+  period: week
+  date: "{{date}}"
+scripts:
+  - type: afterResponse
+    code: |-
+      pm.test('Expected HTTP status', function () {
+        pm.response.to.have.status(200);
+      });
+    language: text/javascript
+order: 7000

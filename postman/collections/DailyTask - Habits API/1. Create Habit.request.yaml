@@ -1,0 +1,24 @@
+$kind: http-request
+url: "{{baseUrl}}/api/habits"
+method: POST
+headers:
+  Content-Type: application/json
+body:
+  type: json
+  content: |-
+    {
+      "name": "Reading",
+      "description": "Read for 20 minutes daily"
+    }
+scripts:
+  - type: afterResponse
+    code: |-
+      pm.test('Habit created successfully', function () { pm.response.to.have.status(201); });
+      if (pm.response.code === 201) {
+        const response = pm.response.json();
+        if (response.data && response.data.id) {
+          pm.collectionVariables.set('habitId', response.data.id);
+        }
+      }
+    language: text/javascript
+order: 1000

@@ -1,0 +1,20 @@
+$kind: http-request
+url: "{{baseUrl}}/api/water/goal"
+method: PATCH
+headers:
+  Content-Type: application/json
+body:
+  type: json
+  content: |-
+    {
+      "daily_goal_ml": 2500,
+      "timezone": "{{timezone}}"
+    }
+scripts:
+  - type: afterResponse
+    code: |-
+      pm.test('Expected HTTP status', function () {
+        pm.response.to.have.status(200);
+      });
+    language: text/javascript
+order: 2000

@@ -1,0 +1,19 @@
+$kind: http-request
+url: "{{baseUrl}}/api/water/entries/{{entryId}}"
+method: PATCH
+headers:
+  Content-Type: application/json
+body:
+  type: json
+  content: |-
+    {
+      "amount_ml": 300
+    }
+scripts:
+  - type: afterResponse
+    code: |-
+      pm.test('Expected HTTP status', function () {
+        pm.response.to.have.status(200);
+      });
+    language: text/javascript
+order: 9000

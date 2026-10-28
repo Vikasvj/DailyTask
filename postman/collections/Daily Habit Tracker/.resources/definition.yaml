@@ -1,0 +1,27 @@
+$kind: collection
+description: Email/password auth and per-user water tracking. Set email/password, sign up and confirm email, then log in before running protected requests.
+variables:
+  baseUrl: http://localhost:3000
+  email: ""
+  password: ""
+  accessToken: ""
+  entryId: ""
+  timezone: Asia/Kolkata
+  date: ""
+  nextCursor: ""
+scripts:
+  - type: http:beforeRequest
+    code: |-
+      if (!pm.collectionVariables.get('date')) {
+        const timezone = pm.collectionVariables.get('timezone') || 'Asia/Kolkata';
+        const parts = new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
+        const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+        pm.collectionVariables.set('date', values.year + '-' + values.month + '-' + values.day);
+      }
+    language: text/javascript
+auth:
+  - id: b1fbb77e-31c7-4f87-b69c-cdfe8ef26087
+    type: bearer
+    name: bearer auth
+    credentials:
+      token: "{{accessToken}}"
