@@ -1,0 +1,16 @@
+$kind: http-request
+url: "{{baseUrl}}/api/habits/{{habitId}}/completions"
+method: POST
+headers:
+  Content-Type: application/json
+body:
+  type: json
+  content: |-
+    {
+      "completion_date": "{{completionDate}}"
+    }
+scripts:
+  - type: afterResponse
+    code: pm.test('Habit completion saved', function () { pm.response.to.have.status(201); });
+    language: text/javascript
+order: 5000

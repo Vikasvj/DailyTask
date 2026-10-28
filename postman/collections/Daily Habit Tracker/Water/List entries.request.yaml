@@ -1,0 +1,23 @@
+$kind: http-request
+description: Enable the cursor query parameter only when nextCursor is nonempty.
+url: "{{baseUrl}}/api/water/entries?date={{date}}&limit=20"
+method: GET
+queryParams:
+  - key: date
+    value: "{{date}}"
+  - key: limit
+    value: "20"
+  - key: cursor
+    value: "{{nextCursor}}"
+    disabled: true
+scripts:
+  - type: afterResponse
+    code: |-
+      pm.test('Expected HTTP status', function () {
+        pm.response.to.have.status(200);
+      });
+      if (pm.response.code === 200) {
+        pm.collectionVariables.set('nextCursor', pm.response.json().meta.next_cursor || '');
+      }
+    language: text/javascript
+order: 4000
