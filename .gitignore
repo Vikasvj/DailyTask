@@ -6,4 +6,6 @@ coverage/
 *.log
 .npm-cache/
 supabase/.temp/
+postman
+.postman
 
