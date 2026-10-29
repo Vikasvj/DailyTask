@@ -1,11 +1,13 @@
 
 import { getSupabase } from '../config/supabase.js';
 
-const habitColumns =
-  'id,name,description,is_active,created_at,updated_at';
+// const habitColumns =
+//   'id,name,description,is_active,created_at,updated_at';
 
 const completionColumns =
   'id,habit_id,completion_date,completed_at';
+const habitColumns =
+  'id,name,description,schedule_type,schedule_days,schedule_dates,is_active,created_at,updated_at';
 
 const uuid =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -69,8 +71,147 @@ function validDate(value) {
   );
 }
 
+
+const ALL_DAYS = [1, 2, 3, 4, 5, 6, 7];
+
+function validateNumberArray(value, min, max, field) {
+  if (
+    !Array.isArray(value) ||
+    value.length < 1 ||
+    value.length > max ||
+    value.some(
+      (item) =>
+        !Number.isInteger(item) ||
+        item < min ||
+        item > max,
+    ) ||
+    new Set(value).size !== value.length
+  ) {
+    throw invalid(
+      `${field} must contain unique integers from ${min} to ${max}.`,
+    );
+  }
+
+  return [...value].sort((a, b) => a - b);
+}
+
+function normalizeSchedule(input, partial) {
+  const keys = [
+    'schedule_type',
+    'schedule_days',
+    'schedule_dates',
+  ];
+
+  const hasSchedule = keys.some((key) =>
+    Object.hasOwn(input, key),
+  );
+
+  // When updating only name/description, preserve the
+  // existing database schedule by omitting schedule fields.
+  if (partial && !hasSchedule) {
+    return {};
+  }
+
+  const type = input.schedule_type ?? 'daily';
+
+  if (!['daily', 'weekly', 'monthly'].includes(type)) {
+    throw invalid(
+      'schedule_type must be daily, weekly, or monthly.',
+    );
+  }
+
+  if (type === 'daily') {
+    if (
+      input.schedule_dates !== undefined &&
+      (
+        !Array.isArray(input.schedule_dates) ||
+        input.schedule_dates.length !== 0
+      )
+    ) {
+      throw invalid(
+        'Daily schedules must not contain schedule_dates.',
+      );
+    }
+
+    return {
+      schedule_type: 'daily',
+      schedule_days: ALL_DAYS,
+      schedule_dates: [],
+    };
+  }
+
+  if (type === 'weekly') {
+    if (
+      input.schedule_dates !== undefined &&
+      (
+        !Array.isArray(input.schedule_dates) ||
+        input.schedule_dates.length !== 0
+      )
+    ) {
+      throw invalid(
+        'Weekly schedules must not contain schedule_dates.',
+      );
+    }
+
+    if (!Object.hasOwn(input, 'schedule_days')) {
+      throw invalid(
+        'schedule_days is required for weekly schedules.',
+      );
+    }
+
+    return {
+      schedule_type: 'weekly',
+      schedule_days: validateNumberArray(
+        input.schedule_days,
+        1,
+        7,
+        'schedule_days',
+      ),
+      schedule_dates: [],
+    };
+  }
+
+  if (
+    input.schedule_days !== undefined &&
+    (
+      !Array.isArray(input.schedule_days) ||
+      input.schedule_days.some(
+        (day) => !Number.isInteger(day) || day < 1 || day > 7,
+      ) ||
+      new Set(input.schedule_days).size !== input.schedule_days.length
+    )
+  ) {
+    throw invalid('Invalid schedule_days.');
+  }
+
+  if (!Object.hasOwn(input, 'schedule_dates')) {
+    throw invalid(
+      'schedule_dates is required for monthly schedules.',
+    );
+  }
+
+  return {
+    schedule_type: 'monthly',
+    // Keep the legacy column valid for the current database
+    // constraint. Monthly scheduling uses schedule_dates.
+    schedule_days: ALL_DAYS,
+    schedule_dates: validateNumberArray(
+      input.schedule_dates,
+      1,
+      31,
+      'schedule_dates',
+    ),
+  };
+}
+
 function validateHabit(input, partial = false) {
-  onlyFields(input, ['name', 'description']);
+  onlyFields(input, [
+    'name',
+    'description',
+    'schedule_type',
+    'schedule_days',
+    'schedule_dates',
+  ]);
 
   if (
     Object.keys(input).length === 0 ||
@@ -110,8 +251,14 @@ function validateHabit(input, partial = false) {
         : null;
   }
 
+  Object.assign(
+    values,
+    normalizeSchedule(input, partial),
+  );
+
   return values;
 }
+
 
 async function result(query, conflictMessage) {
   const { data, error: cause, status } = await query;

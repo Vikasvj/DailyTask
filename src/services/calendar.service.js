@@ -1,4 +1,17 @@
 import { getSupabase } from '../config/supabase.js';
+import {
+  isEligibleActivityStatus,
+  metricStatus,
+  overallCalendarStatus,
+} from './activity-status.js';
+import {
+  currentScheduledStreak,
+  isHabitScheduledOn,
+  longestScheduledStreak,
+  scheduledCompletionDates,
+  scheduledHabitStatus,
+  streakEndingOnScheduledDate,
+} from './habit-schedule.js';
 
 const PAGE_SIZE = 1000;
 
@@ -190,58 +203,6 @@ function validUUID(value) {
     /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
-function metricStatus(value, goal, date, asOf) {
-  if (date > asOf) return 'future';
-  if (value >= goal) return 'completed';
-  if (value > 0) return 'partial';
-  if (date === asOf) return 'not_started';
-  return 'missed';
-}
-
-function completionDates(rows) {
-  return [...new Set(rows.map((row) => row.completion_date))].sort();
-}
-
-function longestStreak(dates) {
-  let longest = 0;
-  let current = 0;
-  let previous = null;
-
-  for (const date of dates) {
-    current = previous && shiftDate(previous, 1) === date
-      ? current + 1
-      : 1;
-
-    longest = Math.max(longest, current);
-    previous = date;
-  }
-
-  return longest;
-}
-
-function streakEndingOnDate(dateSet, date) {
-  if (!dateSet.has(date)) return 0;
-
-  let streak = 0;
-  let cursor = date;
-
-  while (dateSet.has(cursor)) {
-    streak += 1;
-    cursor = shiftDate(cursor, -1);
-  }
-
-  return streak;
-}
-
-function currentStreak(dateSet, asOf) {
-  if (dateSet.has(asOf)) {
-    return streakEndingOnDate(dateSet, asOf);
-  }
-
-  // Keep yesterday's streak alive until the current day ends.
-  return streakEndingOnDate(dateSet, shiftDate(asOf, -1));
-}
-
 async function readWaterGoal(supabase, userId) {
   const row = await result(
     supabase
@@ -292,7 +253,7 @@ async function readHabits(supabase, userId, habitId) {
   const habits = await fetchAll(() => {
     let query = supabase
       .from('habits')
-      .select('id,name,description,is_active,created_at')
+      .select('id,name,description,schedule_type,schedule_days,schedule_dates,is_active,created_at')
       .eq('user_id', userId)
       .eq('is_active', true)
       .order('created_at', { ascending: true })
@@ -326,6 +287,33 @@ async function readWaterTotals(supabase, start, end, asOf) {
   if (!Array.isArray(rows)) throw unavailable();
 
   return rows;
+}
+
+async function readWaterTrackingStart(supabase, userId, timezone) {
+  const row = await result(
+    supabase
+      .from('water_entries')
+      .select('consumed_at')
+      .eq('user_id', userId)
+      .order('consumed_at', { ascending: true })
+      .limit(1)
+      .maybeSingle(),
+  );
+
+  return row ? localDateFromTimestamp(row.consumed_at, timezone) : null;
+}
+
+function localDateFromTimestamp(value, timezone) {
+  const timestamp = new Date(value);
+  if (!Number.isFinite(timestamp.getTime())) throw unavailable();
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(timestamp);
+  const fields = Object.fromEntries(parts.map(({ type, value: part }) => [type, part]));
+  return `${fields.year}-${fields.month}-${fields.day}`;
 }
 
 async function readStepRows(supabase, userId, start, end, asOf) {
@@ -378,14 +366,17 @@ function buildHabitStats(habits, completions, asOf) {
 
   for (const habit of habits) {
     const rows = rowsByHabit.get(habit.id) ?? [];
-    const dates = completionDates(rows);
     const dateSet = dateSets.get(habit.id) ?? new Set();
+    const dates = scheduledCompletionDates(habit, dateSet, asOf);
 
     stats.set(habit.id, {
       id: habit.id,
       name: habit.name,
-      current_streak: currentStreak(dateSet, asOf),
-      longest_streak: longestStreak(dates),
+      schedule_type: habit.schedule_type ?? 'daily',
+      schedule_days: habit.schedule_days ?? [1, 2, 3, 4, 5, 6, 7],
+      schedule_dates: habit.schedule_dates ?? [],
+      current_streak: currentScheduledStreak(habit, dateSet, asOf),
+      longest_streak: longestScheduledStreak(habit, dateSet, asOf),
       total_completions: dates.length,
       last_completed_date: dates.at(-1) ?? null,
       dates: dateSet,
@@ -396,23 +387,20 @@ function buildHabitStats(habits, completions, asOf) {
 }
 
 function habitDayStatus(habit, date, asOf, completedDates) {
-  if (date > asOf) return 'future';
-
-  const createdDate = habit.created_at?.slice(0, 10);
-  if (createdDate && date < createdDate) return 'not_started';
-
-  if (completedDates.has(date)) return 'completed';
-  if (date === asOf) return 'not_started';
-
-  return 'missed';
+  return scheduledHabitStatus(
+    habit,
+    date,
+    asOf,
+    completedDates.has(date),
+  );
 }
 
-function habitModuleStatus(date, asOf, completed, eligible) {
+function habitModuleStatus(date, asOf, completed, eligible, pending, restDay) {
   if (date > asOf) return 'future';
-  if (eligible === 0) return 'not_started';
+  if (eligible === 0) return restDay > 0 ? 'rest_day' : 'not_started';
   if (completed === eligible) return 'completed';
   if (completed > 0) return 'partial';
-  if (date === asOf) return 'not_started';
+  if (pending > 0 || date === asOf) return 'pending';
   return 'missed';
 }
 
@@ -429,8 +417,10 @@ export async function getMonthlyCalendar(userId, token, query = {}) {
     readStepGoal(supabase, userId),
   ]);
 
-  const defaultAsOf = todayInTimezone(waterGoal.timezone);
-  const asOf = query.as_of ?? defaultAsOf;
+  const waterAsOf = query.as_of ?? todayInTimezone(waterGoal.timezone);
+  const stepsAsOf = query.as_of ?? todayInTimezone(stepGoal.timezone);
+  const habitsAsOf = query.as_of ?? todayInTimezone('Asia/Kolkata');
+  const asOf = [waterAsOf, stepsAsOf, habitsAsOf].sort().at(-1);
 
   if (!validDate(asOf)) {
     throw invalid('as_of must use a valid YYYY-MM-DD date.');
@@ -445,10 +435,11 @@ export async function getMonthlyCalendar(userId, token, query = {}) {
     query.habit_id,
   );
 
-  const [waterRows, stepRows, completionRows] = await Promise.all([
-    readWaterTotals(supabase, start, end, asOf),
-    readStepRows(supabase, userId, start, end, asOf),
-    readCompletions(supabase, userId, habits, asOf),
+  const [waterRows, stepRows, completionRows, waterTrackingStart] = await Promise.all([
+    readWaterTotals(supabase, start, end, waterAsOf),
+    readStepRows(supabase, userId, start, end, stepsAsOf),
+    readCompletions(supabase, userId, habits, habitsAsOf),
+    readWaterTrackingStart(supabase, userId, waterGoal.timezone),
   ]);
 
   const waterByDate = new Map();
@@ -472,8 +463,12 @@ export async function getMonthlyCalendar(userId, token, query = {}) {
   const { stats: streakStats } = buildHabitStats(
     habits,
     completionRows,
-    asOf,
+    habitsAsOf,
   );
+  const completionByDate = new Map(completionRows.map((row) => [
+    `${row.habit_id}:${row.completion_date}`,
+    row.completed_at,
+  ]));
 
   const days = dateRange(start, end).map((date) => {
     const water = waterByDate.get(date) ?? {
@@ -487,14 +482,23 @@ export async function getMonthlyCalendar(userId, token, query = {}) {
       water.total_ml,
       waterGoal.daily_goal_ml,
       date,
-      asOf,
+      waterAsOf,
+      {
+        hasData: waterTrackingStart !== null,
+        knownFrom: waterTrackingStart,
+        todayPendingWithoutData: true,
+      },
     );
 
     const stepsStatus = metricStatus(
       steps,
       stepGoal.daily_goal,
       date,
-      asOf,
+      stepsAsOf,
+      {
+        hasData: stepsByDate.has(date),
+        todayPendingWithoutData: false,
+      },
     );
 
     const habitItems = habits.map((habit) => {
@@ -502,83 +506,90 @@ export async function getMonthlyCalendar(userId, token, query = {}) {
       const status = habitDayStatus(
         habit,
         date,
-        asOf,
+        habitsAsOf,
         stats?.dates ?? new Set(),
       );
 
       return {
         id: habit.id,
         name: habit.name,
+        schedule_type: habit.schedule_type ?? 'daily',
+        schedule_days: habit.schedule_days ?? [1, 2, 3, 4, 5, 6, 7],
+        schedule_dates: habit.schedule_dates ?? [],
         status,
-        completed_at:
-          completionRows.find(
-            (row) =>
-              row.habit_id === habit.id &&
-              row.completion_date === date,
-          )?.completed_at ?? null,
+        completed_at: completionByDate.get(`${habit.id}:${date}`) ?? null,
         streak_on_date:
           status === 'completed'
-            ? streakEndingOnDate(stats?.dates ?? new Set(), date)
-            : date === asOf
+            ? streakEndingOnScheduledDate(habit, stats?.dates ?? new Set(), date)
+              : date === habitsAsOf
               ? stats?.current_streak ?? 0
               : 0,
+        current_streak: stats?.current_streak ?? 0,
+        longest_streak: stats?.longest_streak ?? 0,
       };
     });
-
-    const eligibleHabits = date > asOf
-      ? 0
-      : habits.filter((habit) => {
-          const created = habit.created_at?.slice(0, 10);
-          return !created || created <= date;
-        }).length;
 
     const completedHabits = habitItems.filter(
       (habit) => habit.status === 'completed',
     ).length;
-
     const missedHabits = habitItems.filter(
       (habit) => habit.status === 'missed',
     ).length;
+    const pendingHabits = habitItems.filter(
+      (habit) => habit.status === 'pending',
+    ).length;
+    const restDayHabits = habitItems.filter(
+      (habit) => habit.status === 'rest_day',
+    ).length;
+    const notStartedHabits = habitItems.filter(
+      (habit) => habit.status === 'not_started',
+    ).length;
+    const futureHabits = habitItems.filter(
+      (habit) => habit.status === 'future',
+    ).length;
+    const eligibleHabits = completedHabits + missedHabits + pendingHabits;
 
     const habitStatus = habitModuleStatus(
       date,
-      asOf,
+      habitsAsOf,
       completedHabits,
       eligibleHabits,
+      pendingHabits,
+      restDayHabits,
     );
 
-    const activeRatios = [
-      statusProgress(
-        waterStatus,
-        water.total_ml / waterGoal.daily_goal_ml,
-      ),
-      statusProgress(
-        stepsStatus,
-        steps / stepGoal.daily_goal,
-      ),
-    ];
-
-    if (eligibleHabits > 0) {
-      activeRatios.push(completedHabits / eligibleHabits);
+    const activities = [];
+    if (isEligibleActivityStatus(waterStatus)) {
+      activities.push({
+        status: waterStatus,
+        progress: statusProgress(waterStatus, water.total_ml / waterGoal.daily_goal_ml),
+      });
+    }
+    if (isEligibleActivityStatus(stepsStatus)) {
+      activities.push({
+        status: stepsStatus,
+        progress: statusProgress(stepsStatus, steps / stepGoal.daily_goal),
+      });
     }
 
-    const progressPercent = date > asOf
+    if (eligibleHabits > 0) {
+      activities.push({
+        status: habitStatus,
+        progress: completedHabits / eligibleHabits,
+      });
+    }
+
+    const progressPercent = activities.length === 0
       ? 0
       : Math.round(
-          (activeRatios.reduce((sum, value) => sum + value, 0) /
-            activeRatios.length) *
-            100,
+          (activities.reduce((sum, activity) => sum + activity.progress, 0) /
+            activities.length) * 100,
         );
-
-    const overallStatus = date > asOf
-      ? 'future'
-      : progressPercent >= 100
-        ? 'completed'
-        : progressPercent > 0
-          ? 'partial'
-          : date === asOf
-            ? 'not_started'
-            : 'missed';
+    const overallStatus = overallCalendarStatus(date, asOf, [
+      waterStatus,
+      stepsStatus,
+      habitStatus,
+    ]);
 
     return {
       date,
@@ -589,8 +600,7 @@ export async function getMonthlyCalendar(userId, token, query = {}) {
         progress_percent: Math.round(
           (water.total_ml / waterGoal.daily_goal_ml) * 1000,
         ) / 10,
-        goal_achieved: water.total_ml >= waterGoal.daily_goal_ml &&
-          date <= asOf,
+        goal_achieved: waterStatus === 'completed',
         status: waterStatus,
       },
       steps: {
@@ -599,26 +609,27 @@ export async function getMonthlyCalendar(userId, token, query = {}) {
         progress_percent: Math.round(
           (steps / stepGoal.daily_goal) * 1000,
         ) / 10,
-        goal_achieved: steps >= stepGoal.daily_goal && date <= asOf,
+        goal_achieved: stepsStatus === 'completed',
         status: stepsStatus,
       },
       habits: {
         completed: completedHabits,
         eligible: eligibleHabits,
         missed: missedHabits,
-        not_started: habitItems.filter(
-          (habit) => habit.status === 'not_started',
-        ).length,
+        pending: pendingHabits,
+        rest_day: restDayHabits,
+        not_started: notStartedHabits,
+        future: futureHabits,
         total_habits: habits.length,
         status: habitStatus,
         items: habitItems,
       },
       overall: {
         progress_percent: progressPercent,
-        completed_activities: activeRatios.filter(
-          (value) => value >= 1,
+        completed_activities: activities.filter(
+          (activity) => activity.status === 'completed',
         ).length,
-        eligible_activities: activeRatios.length,
+        eligible_activities: activities.length,
         status: overallStatus,
       },
     };
@@ -630,6 +641,9 @@ export async function getMonthlyCalendar(userId, token, query = {}) {
     return {
       id: habit.id,
       name: habit.name,
+      schedule_type: stats?.schedule_type ?? 'daily',
+      schedule_days: stats?.schedule_days ?? [1, 2, 3, 4, 5, 6, 7],
+      schedule_dates: stats?.schedule_dates ?? [],
       current_streak: stats?.current_streak ?? 0,
       longest_streak: stats?.longest_streak ?? 0,
       total_completions: stats?.total_completions ?? 0,
@@ -642,8 +656,24 @@ export async function getMonthlyCalendar(userId, token, query = {}) {
   );
 
   const daysUpToAsOf = days.filter((day) => day.date <= asOf);
+  const waterDaysUpToAsOf = days.filter((day) => day.date <= waterAsOf);
+  const stepsDaysUpToAsOf = days.filter((day) => day.date <= stepsAsOf);
+  const habitDaysUpToAsOf = days.filter((day) => day.date <= habitsAsOf);
+  const habitsById = new Map(habits.map((habit) => [habit.id, habit]));
   const monthCompletions = completionRows.filter(
-    (row) => row.completion_date >= start && row.completion_date <= end,
+    (row) => {
+      const habit = habitsById.get(row.habit_id);
+      return row.completion_date >= start && row.completion_date <= end &&
+        habit && isHabitScheduledOn(habit, row.completion_date);
+    },
+  );
+  const eligibleActivityCount = daysUpToAsOf.reduce(
+    (sum, day) => sum + day.overall.eligible_activities,
+    0,
+  );
+  const completedActivityCount = daysUpToAsOf.reduce(
+    (sum, day) => sum + day.overall.completed_activities,
+    0,
   );
 
   return {
@@ -663,22 +693,28 @@ export async function getMonthlyCalendar(userId, token, query = {}) {
     },
     summary: {
       active_habits: habits.length,
-      water_total_ml: daysUpToAsOf.reduce(
+      water_total_ml: waterDaysUpToAsOf.reduce(
         (sum, day) => sum + day.water.total_ml,
         0,
       ),
-      water_goal_achieved_days: daysUpToAsOf.filter(
+      water_goal_achieved_days: waterDaysUpToAsOf.filter(
         (day) => day.water.goal_achieved,
       ).length,
-      total_steps: daysUpToAsOf.reduce(
+      water_known_days: waterDaysUpToAsOf.filter(
+        (day) => ['completed', 'partial', 'missed', 'pending'].includes(day.water.status),
+      ).length,
+      total_steps: stepsDaysUpToAsOf.reduce(
         (sum, day) => sum + day.steps.steps,
         0,
       ),
-      steps_goal_achieved_days: daysUpToAsOf.filter(
+      steps_recorded_days: stepsDaysUpToAsOf.filter(
+        (day) => day.steps.status !== 'no_data',
+      ).length,
+      steps_goal_achieved_days: stepsDaysUpToAsOf.filter(
         (day) => day.steps.goal_achieved,
       ).length,
       habit_completions_in_month: monthCompletions.length,
-      days_with_all_habits_completed: daysUpToAsOf.filter(
+      days_with_all_habits_completed: habitDaysUpToAsOf.filter(
         (day) =>
           day.habits.eligible > 0 &&
           day.habits.completed === day.habits.eligible,
@@ -691,8 +727,35 @@ export async function getMonthlyCalendar(userId, token, query = {}) {
         0,
         ...streaks.map((habit) => habit.longest_streak),
       ),
+      habit_eligible_occurrences: habitDaysUpToAsOf.reduce(
+        (sum, day) => sum + day.habits.eligible,
+        0,
+      ),
+      habit_missed_occurrences: habitDaysUpToAsOf.reduce(
+        (sum, day) => sum + day.habits.missed,
+        0,
+      ),
+      habit_pending_occurrences: habitDaysUpToAsOf.reduce(
+        (sum, day) => sum + day.habits.pending,
+        0,
+      ),
+      habit_rest_days: habitDaysUpToAsOf.reduce(
+        (sum, day) => sum + day.habits.rest_day,
+        0,
+      ),
+      eligible_activities: eligibleActivityCount,
+      completed_activities: completedActivityCount,
+      activity_completion_rate_percent: eligibleActivityCount === 0
+        ? 0
+        : Math.round((completedActivityCount / eligibleActivityCount) * 100),
     },
-    available_habits: habits.map(({ id, name }) => ({ id, name })),
+    available_habits: habits.map((habit) => ({
+      id: habit.id,
+      name: habit.name,
+      schedule_type: habit.schedule_type ?? 'daily',
+      schedule_days: habit.schedule_days ?? [1, 2, 3, 4, 5, 6, 7],
+      schedule_dates: habit.schedule_dates ?? [],
+    })),
     streaks,
     days,
   };

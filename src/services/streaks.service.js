@@ -1,5 +1,13 @@
 
 import { getSupabase } from '../config/supabase.js';
+import {
+  countScheduledOccurrences,
+  currentScheduledStreak,
+  isHabitScheduledOn,
+  longestScheduledStreak,
+  scheduledCompletionDates,
+  scheduledHabitStatus,
+} from './habit-schedule.js';
 
 const PAGE_SIZE = 1000;
 
@@ -179,14 +187,6 @@ function dateFromTimestamp(value) {
   return typeof value === 'string' ? value.slice(0, 10) : null;
 }
 
-function maxDate(a, b) {
-  return a > b ? a : b;
-}
-
-function minDate(a, b) {
-  return a < b ? a : b;
-}
-
 function datesBetween(start, end) {
   if (start > end) {
     return [];
@@ -237,7 +237,7 @@ async function getHabitOrThrow(supabase, userId, habitId) {
   const habit = await queryData(
     supabase
       .from('habits')
-      .select('id, user_id, name, description, is_active, created_at')
+      .select('id, user_id, name, description, schedule_type, schedule_days, schedule_dates, is_active, created_at')
       .eq('id', habitId)
       .eq('user_id', userId)
       .maybeSingle(),
@@ -254,7 +254,7 @@ async function getActiveHabits(supabase, userId) {
   return queryAllRows(() =>
     supabase
       .from('habits')
-      .select('id, user_id, name, description, is_active, created_at')
+      .select('id, user_id, name, description, schedule_type, schedule_days, schedule_dates, is_active, created_at')
       .eq('user_id', userId)
       .eq('is_active', true)
       .order('created_at', { ascending: true })
@@ -328,62 +328,8 @@ function uniqueDates(rows, asOf) {
   ].sort();
 }
 
-function longestStreak(dates) {
-  let longest = 0;
-  let current = 0;
-  let previous = null;
-
-  for (const date of dates) {
-    if (
-      previous !== null &&
-      shiftDate(previous, 1) === date
-    ) {
-      current += 1;
-    } else {
-      current = 1;
-    }
-
-    longest = Math.max(longest, current);
-    previous = date;
-  }
-
-  return longest;
-}
-
-function currentStreak(dates, asOf) {
-  const completed = new Set(dates);
-
-  // A streak remains current during today if yesterday
-  // was completed and today's completion is still pending.
-  let date = completed.has(asOf)
-    ? asOf
-    : shiftDate(asOf, -1);
-
-  let streak = 0;
-
-  while (completed.has(date)) {
-    streak += 1;
-    date = shiftDate(date, -1);
-  }
-
-  return streak;
-}
-
 function eligibleDays(habit, start, end) {
-  if (start > end) {
-    return 0;
-  }
-
-  const createdDate = dateFromTimestamp(habit.created_at);
-  const firstEligibleDate = createdDate
-    ? maxDate(start, createdDate)
-    : start;
-
-  if (firstEligibleDate > end) {
-    return 0;
-  }
-
-  return dayDifferenceInclusive(firstEligibleDate, end);
+  return countScheduledOccurrences(habit, start, end);
 }
 
 function rateForDates(dates, habit, start, end) {
@@ -401,7 +347,11 @@ function rateForDates(dates, habit, start, end) {
 }
 
 function habitMetrics(habit, rows, asOf) {
-  const dates = uniqueDates(rows, asOf);
+  const dates = scheduledCompletionDates(
+    habit,
+    uniqueDates(rows, asOf),
+    asOf,
+  );
   const createdDate = dateFromTimestamp(habit.created_at);
   const lastCompletedDate = dates.at(-1) ?? null;
 
@@ -411,8 +361,11 @@ function habitMetrics(habit, rows, asOf) {
     description: habit.description,
     is_active: habit.is_active,
     created_at: habit.created_at,
-    current_streak: currentStreak(dates, asOf),
-    longest_streak: longestStreak(dates),
+    schedule_type: habit.schedule_type ?? 'daily',
+    schedule_days: habit.schedule_days ?? [1, 2, 3, 4, 5, 6, 7],
+    schedule_dates: habit.schedule_dates ?? [],
+    current_streak: currentScheduledStreak(habit, dates, asOf),
+    longest_streak: longestScheduledStreak(habit, dates, asOf),
     total_completions: dates.length,
     last_completed_date: lastCompletedDate,
     completion_rate_7d: rateForDates(
@@ -431,6 +384,15 @@ function habitMetrics(habit, rows, asOf) {
   };
 }
 
+function habitStatusForDate(habit, date, asOf, completionByDate) {
+  return scheduledHabitStatus(
+    habit,
+    date,
+    asOf,
+    completionByDate.has(date),
+  );
+}
+
 function overallRate(habits, rows, start, end) {
   const denominator = habits.reduce(
     (total, habit) => total + eligibleDays(habit, start, end),
@@ -441,10 +403,12 @@ function overallRate(habits, rows, start, end) {
     return 0;
   }
 
-  const count = rows.filter(
-    (row) => row.completion_date >= start &&
-      row.completion_date <= end,
-  ).length;
+  const habitsById = new Map(habits.map((habit) => [habit.id, habit]));
+  const count = rows.filter((row) => {
+    const habit = habitsById.get(row.habit_id);
+    return row.completion_date >= start && row.completion_date <= end &&
+      habit && isHabitScheduledOn(habit, row.completion_date);
+  }).length;
 
   return Math.round((count / denominator) * 100);
 }
@@ -649,20 +613,8 @@ export async function getHabitCalendar(
     daysInMonth(month),
   ).padStart(2, '0')}`;
 
-  const createdDate = dateFromTimestamp(habit.created_at);
-
   const days = datesBetween(firstDate, lastDate).map((date) => {
-    let status;
-
-    if (date > asOf) {
-      status = 'future';
-    } else if (createdDate && date < createdDate) {
-      status = 'not_started';
-    } else if (completionByDate.has(date)) {
-      status = 'completed';
-    } else {
-      status = 'missed';
-    }
+    const status = habitStatusForDate(habit, date, asOf, completionByDate);
 
     return {
       date,
@@ -678,6 +630,9 @@ export async function getHabitCalendar(
       name: habit.name,
       description: habit.description,
       is_active: habit.is_active,
+      schedule_type: habit.schedule_type ?? 'daily',
+      schedule_days: habit.schedule_days ?? [1, 2, 3, 4, 5, 6, 7],
+      schedule_dates: habit.schedule_dates ?? [],
     },
     month,
     as_of: asOf,
@@ -730,21 +685,9 @@ export async function getHabitHistory(
     rows.map((row) => [row.completion_date, row.completed_at]),
   );
 
-  const createdDate = dateFromTimestamp(habit.created_at);
-
   const entries = datesBetween(start, end)
     .map((date) => {
-      let status;
-
-      if (date > asOf) {
-        status = 'future';
-      } else if (createdDate && date < createdDate) {
-        status = 'not_started';
-      } else if (completionByDate.has(date)) {
-        status = 'completed';
-      } else {
-        status = 'missed';
-      }
+      const status = habitStatusForDate(habit, date, asOf, completionByDate);
 
       return {
         date,
@@ -758,6 +701,9 @@ export async function getHabitHistory(
     habit: {
       id: habit.id,
       name: habit.name,
+      schedule_type: habit.schedule_type ?? 'daily',
+      schedule_days: habit.schedule_days ?? [1, 2, 3, 4, 5, 6, 7],
+      schedule_dates: habit.schedule_dates ?? [],
     },
     from: start,
     to: end,
@@ -795,11 +741,17 @@ export async function getInsights(
     habitMetrics(habit, grouped.get(habit.id) ?? [], asOf),
   );
 
-  const periodRows = allRows.filter(
-    (row) =>
-      row.completion_date >= window.start &&
-      row.completion_date <= window.effectiveEnd,
-  );
+  const habitsById = new Map(habits.map((habit) => [habit.id, habit]));
+  const scheduledRows = allRows.filter((row) => {
+    const habit = habitsById.get(row.habit_id);
+    return habit && isHabitScheduledOn(habit, row.completion_date);
+  });
+  const periodRows = scheduledRows.filter((row) => {
+    const habit = habitsById.get(row.habit_id);
+    return row.completion_date >= window.start &&
+      row.completion_date <= window.effectiveEnd &&
+      habit;
+  });
 
   const denominator = habits.reduce(
     (sum, habit) =>
@@ -814,7 +766,11 @@ export async function getInsights(
   const topPerformingHabits = habits
     .map((habit) => {
       const rows = grouped.get(habit.id) ?? [];
-      const dates = uniqueDates(rows, asOf);
+      const dates = scheduledCompletionDates(
+        habit,
+        uniqueDates(rows, asOf),
+        asOf,
+      );
       const completionCount = dates.filter(
         (date) =>
           date >= window.start &&
@@ -830,8 +786,11 @@ export async function getInsights(
       return {
         id: habit.id,
         name: habit.name,
-        current_streak: currentStreak(dates, asOf),
-        longest_streak: longestStreak(dates),
+        schedule_type: habit.schedule_type ?? 'daily',
+        schedule_days: habit.schedule_days ?? [1, 2, 3, 4, 5, 6, 7],
+        schedule_dates: habit.schedule_dates ?? [],
+        current_streak: currentScheduledStreak(habit, dates, asOf),
+        longest_streak: longestScheduledStreak(habit, dates, asOf),
         completion_count: completionCount,
         eligible_days: eligible,
         completion_rate: eligible === 0
@@ -866,7 +825,7 @@ export async function getInsights(
         ...activeMetrics.map((habit) => habit.current_streak),
       ),
       total_completions: periodRows.length,
-      all_time_completions: allRows.length,
+      all_time_completions: scheduledRows.length,
       completion_rate: completionRate,
       eligible_habit_days: denominator,
     },
