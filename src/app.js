@@ -21,7 +21,11 @@ app.use((req, res, next) => {
   const origin = req.get('Origin');
   const localOrigin = typeof origin === 'string' &&
     /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?$/.test(origin);
-  if (config.NODE_ENV !== 'production' && localOrigin) {
+  const allowedOrigin = typeof origin === 'string' && (
+    config.CORS_ORIGINS.includes(origin) ||
+    (config.NODE_ENV !== 'production' && localOrigin)
+  );
+  if (allowedOrigin) {
     res.set('Access-Control-Allow-Origin', origin);
     if (req.method === 'OPTIONS') {
       res.set('Access-Control-Allow-Methods', 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS');

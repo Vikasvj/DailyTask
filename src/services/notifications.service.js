@@ -52,7 +52,7 @@ function databaseError(cause, status) {
     return error(
       503,
       'NOTIFICATION_SETUP_REQUIRED',
-      'Notification setup is incomplete. Apply the automatic notifications migration.',
+      'Notification setup is incomplete. Apply the notifications migrations.',
     );
   }
   if (status === 429) {
@@ -73,6 +73,14 @@ function databaseError(cause, status) {
 
   if (['23514', '23502', '22023', '22P02'].includes(cause.code)) {
     return invalid();
+  }
+
+  if (cause.code === '23505') {
+    return error(
+      409,
+      'DEVICE_ALREADY_REGISTERED',
+      'This device is active on another account. Sign out there before registering it here.',
+    );
   }
 
   if (cause.code === '42501') {
@@ -239,5 +247,103 @@ export async function markAllAsRead(userId, token) {
 
   return {
     updated_count: updated.length,
+  };
+}
+
+// Device tokens are scoped to the authenticated account. The database RPC
+// refuses to transfer a token that is already registered to another user.
+export async function registerDevice(userId, token, input) {
+  onlyFields(input, ['installation_id', 'platform']);
+  if (typeof input.installation_id !== 'string' ||
+      input.installation_id.length < 20 || input.installation_id.length > 4096 ||
+      !['android', 'ios', 'web'].includes(input.platform)) {
+    throw invalid();
+  }
+  const rows = await result(getSupabase(token).rpc('register_fcm_device', {
+    p_fid: input.installation_id,
+    p_platform: input.platform,
+  }));
+  const device = Array.isArray(rows) ? rows[0] : rows;
+  if (!device || device.user_id !== userId || typeof device.id !== 'string') {
+    throw unavailable();
+  }
+  return { registered: true, platform: device.platform, updated_at: device.updated_at };
+}
+
+export async function unregisterDevice(userId, token, input) {
+  onlyFields(input, ['installation_id']);
+  if (typeof input.installation_id !== 'string' ||
+      input.installation_id.length < 20 || input.installation_id.length > 4096) {
+    throw invalid();
+  }
+  const deactivated = await result(getSupabase(token).rpc('unregister_fcm_device', {
+    p_fid: input.installation_id,
+  }));
+  if (typeof deactivated !== 'boolean') throw unavailable();
+  return { unregistered: true, deactivated };
+}
+
+const preferenceFields = [
+  'timezone', 'habit_reminders_enabled', 'habit_reminder_time',
+  'water_reminders_enabled', 'water_reminder_times',
+  'steps_reminders_enabled', 'steps_reminder_time',
+];
+
+function validTime(value) {
+  return typeof value === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+}
+
+function validatePreferences(input) {
+  onlyFields(input, preferenceFields);
+  if (!Object.keys(input).length) throw invalid();
+  if (Object.hasOwn(input, 'timezone')) {
+    try {
+      if (typeof input.timezone !== 'string' || input.timezone.length > 100 ||
+          (input.timezone !== 'UTC' && !input.timezone.includes('/'))) throw new Error();
+      new Intl.DateTimeFormat('en', { timeZone: input.timezone });
+    } catch { throw invalid(); }
+  }
+  for (const key of ['habit_reminders_enabled', 'water_reminders_enabled', 'steps_reminders_enabled']) {
+    if (Object.hasOwn(input, key) && typeof input[key] !== 'boolean') throw invalid();
+  }
+  for (const key of ['habit_reminder_time', 'steps_reminder_time']) {
+    if (Object.hasOwn(input, key) && !validTime(input[key])) throw invalid();
+  }
+  if (Object.hasOwn(input, 'water_reminder_times')) {
+    const times = input.water_reminder_times;
+    if (!Array.isArray(times) || times.length > 8 || times.some((time) => !validTime(time)) ||
+        new Set(times).size !== times.length) throw invalid();
+  }
+  return input;
+}
+
+export async function getReminderPreferences(userId, token) {
+  const supabase = getSupabase(token);
+  const existing = await result(supabase.from('notification_preferences')
+    .select('*').eq('user_id', userId).maybeSingle());
+  if (existing) return normalizePreferences(existing);
+  await result(supabase.from('notification_preferences')
+    .upsert({ user_id: userId }, { onConflict: 'user_id', ignoreDuplicates: true }));
+  const inserted = await result(supabase.from('notification_preferences')
+    .select('*').eq('user_id', userId).single());
+  return normalizePreferences(inserted);
+}
+
+export async function updateReminderPreferences(userId, token, input) {
+  const values = validatePreferences(input);
+  const updated = await result(getSupabase(token).from('notification_preferences')
+    .upsert({ ...values, user_id: userId, updated_at: new Date().toISOString() },
+      { onConflict: 'user_id' }).select('*').single());
+  return normalizePreferences(updated);
+}
+
+function normalizePreferences(row) {
+  const time = (value) => typeof value === 'string' ? value.slice(0, 5) : value;
+  return {
+    ...row,
+    habit_reminder_time: time(row.habit_reminder_time),
+    steps_reminder_time: time(row.steps_reminder_time),
+    water_reminder_times: Array.isArray(row.water_reminder_times)
+      ? row.water_reminder_times.map(time) : [],
   };
 }
