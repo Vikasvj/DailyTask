@@ -60,3 +60,36 @@ export async function markAllAsRead(req, res) {
     ),
   });
 }
+
+export async function registerDevice(req, res) {
+  noQuery(req);
+  res.json({ data: await notificationsService.registerDevice(
+    req.user.id, req.accessToken, req.body,
+  ) });
+}
+
+export async function unregisterDevice(req, res) {
+  noQuery(req);
+  res.json({ data: await notificationsService.unregisterDevice(
+    req.user.id, req.accessToken, req.body,
+  ) });
+}
+
+export async function getReminderPreferences(req, res) {
+  noQuery(req);
+  if (Object.keys(req.body ?? {}).length) {
+    throw Object.assign(new Error('Unexpected request body.'), {
+      status: 400, code: 'INVALID_INPUT', expose: true,
+    });
+  }
+  res.json({ data: await notificationsService.getReminderPreferences(
+    req.user.id, req.accessToken,
+  ) });
+}
+
+export async function updateReminderPreferences(req, res) {
+  noQuery(req);
+  res.json({ data: await notificationsService.updateReminderPreferences(
+    req.user.id, req.accessToken, req.body,
+  ) });
+}

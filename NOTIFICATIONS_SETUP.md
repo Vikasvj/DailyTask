@@ -68,8 +68,9 @@ The connected Supabase account currently lists no projects, so this migration ha
    creation, content edits, ownership changes and deletion are not granted.
 5. Restart the backend yourself, then fully restart the configured Flutter app.
 
-No service-role key or new environment variable is needed. The backend reports
-`NOTIFICATION_SETUP_REQUIRED` if the new function/table is missing.
+That migration only enables the existing in-app event creation. The FCM migration
+and backend-only credentials below are also required for device registration and
+push delivery.
 
 ## Manual verification
 
@@ -89,3 +90,73 @@ curl.exe -H "Authorization: Bearer <ACCESS_TOKEN>" "http://localhost:3000/api/no
 Tests use local Auth/PostgREST fixtures and real PostgreSQL via existing PGlite.
 Live schema constraints, Supabase advisors and real Android sensor-to-cloud flow
 still require verification in your own project/device.
+
+## FCM devices, push delivery, and reminders
+
+The Flutter app uses the Firebase Installation ID (FID) registration API from the
+installed Firebase Messaging SDK. The backend stores that identifier as a private
+device record and sends to it with Firebase Admin. Firebase's current guidance
+uses FIDs with `register()` / `onRegistered`; the old registration-token methods
+are deprecated. Foreground pushes use a local Android notification channel.
+
+### Database and API
+
+Apply `supabase/migrations/20261031120000_fcm_devices_and_reminders.sql` after
+the automatic notifications migration above. It adds:
+
+- `notification_devices` with globally unique FIDs and owner-bound registration
+  and unregister RPCs.
+- `notification_preferences` with a timezone and configurable habit, water, and
+  steps reminder times. Preferences are private to their Supabase user.
+- `notification_push_outbox` and per-device delivery rows, populated by a
+  trigger whenever an in-app notification is inserted.
+
+Authenticated API routes:
+
+- `POST /api/notifications/devices` — `{ "installation_id": "...", "platform": "android" }`
+- `DELETE /api/notifications/devices/current` — `{ "installation_id": "..." }`
+- `GET /api/notifications/reminders`
+- `PATCH /api/notifications/reminders` — partial updates to timezone and reminder settings.
+
+The existing list, unread-count, mark-one-read, and mark-all-read routes remain
+unchanged. Notification taps route from the saved notification data and mark the
+notification read when an ID is present.
+
+### Backend secrets and worker
+
+Set these in the backend host's secret environment only. `.env.example` contains
+placeholders; do not put credentials in Flutter config, Git, or this document.
+
+- `SUPABASE_SERVICE_ROLE_KEY` — required only by trusted worker/Admin SDK access.
+- `FIREBASE_PROJECT_ID=dailytask-cc261`
+- `FIREBASE_CLIENT_EMAIL` — service account email from Firebase project settings.
+- `FIREBASE_PRIVATE_KEY` — service account private key; store as a secret. Escaped
+  `\n` line breaks are expanded by the backend.
+
+Create the Firebase service account in Firebase Console → Project settings →
+Service accounts, then add its email/private key to the backend host. Never add
+the downloaded service-account JSON to the repository. The Firebase Android
+app remains `com.example.daily_habit_tracker`; its existing `google-services.json`
+and `lib/firebase_options.dart` are reused.
+
+Run the worker as a **one-shot scheduled job every minute**, not as a loop in the
+Express web service:
+
+```sh
+npm run reminders:run
+```
+
+The worker checks scheduled active habits, skips already-completed habits,
+checks water totals and synced step rows, writes deduplicated notifications to
+the existing history, then drains the per-device push outbox. A missing daily
+step row is treated as unknown and does not generate a step reminder. Cron retries
+are keyed by user/activity/date/scheduled time and per device.
+
+### Android verification and remaining platform setup
+
+On Android 13 and later, approve the notification prompt when DailyTask asks.
+If denied, enable notifications in Android App info; the app does not repeatedly
+prompt. Ensure Firebase Cloud Messaging is enabled for the project. A connected
+Android device and the backend migration/secrets/worker are required for a real
+end-to-end delivery test. iOS additionally requires APNs credentials in Firebase;
+web push is not wired in this Android-first integration.

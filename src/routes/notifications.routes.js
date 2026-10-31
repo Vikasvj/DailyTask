@@ -29,6 +29,12 @@ router.use(
 // GET /api/notifications
 router.get('/', controller.listNotifications);
 
+// Device registration and user-owned reminder preferences.
+router.post('/devices', controller.registerDevice);
+router.delete('/devices/current', controller.unregisterDevice);
+router.get('/reminders', controller.getReminderPreferences);
+router.patch('/reminders', controller.updateReminderPreferences);
+
 // GET /api/notifications/unread-count
 router.get('/unread-count', controller.getUnreadCount);
 
