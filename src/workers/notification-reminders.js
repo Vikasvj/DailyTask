@@ -11,7 +11,7 @@ function localNow(timezone, instant = new Date()) {
   return { date: `${values.year}-${values.month}-${values.day}`, time: `${values.hour}:${values.minute}` };
 }
 
-export function dueTime(configuredTimes, currentTime, graceMinutes = 4) {
+export function dueTime(configuredTimes, currentTime, graceMinutes = 15) {
   const currentMinutes = Number(currentTime.slice(0, 2)) * 60 + Number(currentTime.slice(3, 5));
   return configuredTimes
     .map((value) => value.slice(0, 5))
