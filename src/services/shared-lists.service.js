@@ -107,12 +107,12 @@ export async function listLists(userId, token) {
   return rows.map((row) => ({ ...row, access: row.owner_id === userId ? 'owner' : 'shared' }));
 }
 
-export async function createList(userId, token, input) {
+export async function createList(token, input) {
   onlyFields(input, ['name']);
   if (!Object.hasOwn(input, 'name')) throw invalid('name');
-  const data = await result(getSupabase(token).from('shared_lists')
-    .insert({ owner_id: userId, name: validateName(input.name) })
-    .select(listColumns).single());
+  const data = await result(getSupabase(token).rpc('create_shared_list', {
+    p_name: validateName(input.name),
+  }));
   return { ...requireData(data, 'list'), access: 'owner' };
 }
 

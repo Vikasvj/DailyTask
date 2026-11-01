@@ -16,7 +16,7 @@ export async function listLists(req, res) {
 export async function createList(req, res) {
   noQuery(req);
   res.status(201).json({
-    data: await sharedListsService.createList(req.user.id, req.accessToken, req.body),
+    data: await sharedListsService.createList(req.accessToken, req.body),
   });
 }
 
