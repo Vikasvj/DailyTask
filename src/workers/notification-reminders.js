@@ -129,6 +129,7 @@ async function sendQueuedPushes(db) {
       const routeByType = {
         water_goal: 'water', water_reminder: 'water', step_goal: 'steps',
         steps_reminder: 'steps', habit_reminder: 'habits',
+        shared_list_invite: 'lists',
       };
       const screen = typeof source.screen === 'string' ? source.screen : (routeByType[row.type] ?? 'notifications');
       const { data: pending, error: pendingError } = await db.from('notification_push_deliveries')

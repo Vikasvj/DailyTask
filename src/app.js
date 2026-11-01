@@ -9,6 +9,7 @@ import notificationsRoutes from './routes/notifications.routes.js';
 import habitsRoutes from './routes/habits.routes.js';
 import streaksRoutes from './routes/streaks.routes.js';
 import calendarRoutes from './routes/calendar.routes.js';
+import sharedListsRoutes from './routes/shared-lists.routes.js';
 const app = express();
 const config = readEnv();
 app.disable('x-powered-by');
@@ -89,6 +90,7 @@ app.use('/api/notifications', notificationsRoutes);
 app.use('/api/habits', habitsRoutes);
 app.use('/api/streaks', streaksRoutes);
 app.use('/api/calendar', calendarRoutes);
+app.use('/api/lists', sharedListsRoutes);
 app.use((req, res) => res.status(404).json({
   error: { code: 'NOT_FOUND', message: 'Endpoint not found.' },
 }));
