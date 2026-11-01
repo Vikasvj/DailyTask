@@ -8,4 +8,5 @@ coverage/
 supabase/.temp/
 postman
 .postman
+supabase/migrations/20261101140000_shared_lists.sql
 
